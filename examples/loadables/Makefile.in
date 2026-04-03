@@ -103,15 +103,25 @@ INC = -I. -I.. -I$(topdir) -I$(topdir)/lib -I$(topdir)/builtins -I${srcdir} \
 ALLPROG = print truefalse sleep finfo logname basename dirname fdflags \
 	  tty pathchk tee head mkdir rmdir mkfifo mktemp printenv id whoami \
 	  uname sync push ln unlink realpath strftime mypid setpgid seq rm \
-	  accept csv dsv cut stat getconf kv strptime chmod fltexpr
+	  accept csv dsv cut stat getconf kv strptime chmod fltexpr \
+	  readline_filter_bun_bridge
 OTHERPROG = necho hello cat pushd asort
 
 SUBDIRS = perl
 
 all:	$(SHOBJ_STATUS)
 
-supported:	$(ALLPROG)
+supported:	$(ALLPROG) sqlite3-plugins
 others:		$(OTHERPROG)
+
+# Build sqlite3 history plugin if libsqlite3 is available
+sqlite3-plugins:
+	@if $(CC) -x c -o /dev/null /dev/null -lsqlite3 2>/dev/null; then \
+		echo "  Building readline_filter_history_sqlite (sqlite3 found)"; \
+		$(MAKE) readline_filter_history_sqlite; \
+	else \
+		echo "  Skipping readline_filter_history_sqlite (libsqlite3-dev not found)"; \
+	fi
 
 unsupported:
 	@echo "Your system (${host_os}) is not supported by the"
@@ -255,6 +265,13 @@ asort:	asort.o
 
 fltexpr:	fltexpr.o
 	$(SHOBJ_LD) $(SHOBJ_LDFLAGS) $(SHOBJ_XLDFLAGS) -o $@ fltexpr.o $(SHOBJ_LIBS) -lm
+
+# Readline input filter plugins (READLINE_INPUT_FILTER_LIB)
+readline_filter_bun_bridge:	readline_filter_bun_bridge.o
+	$(SHOBJ_LD) $(SHOBJ_LDFLAGS) $(SHOBJ_XLDFLAGS) -o $@ readline_filter_bun_bridge.o $(SHOBJ_LIBS)
+
+readline_filter_history_sqlite:	readline_filter_history_sqlite.o
+	$(SHOBJ_LD) $(SHOBJ_LDFLAGS) $(SHOBJ_XLDFLAGS) -o $@ readline_filter_history_sqlite.o $(SHOBJ_LIBS) -lsqlite3
 
 
 # pushd is a special case.  We use the same source that the builtin version

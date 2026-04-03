@@ -116,3 +116,26 @@ examples/loadables/tty
 examples/loadables/uname
 examples/loadables/unlink
 examples/loadables/whoami
+examples/loadables/chmod
+examples/loadables/dsv
+examples/loadables/fltexpr
+examples/loadables/getconf
+examples/loadables/kv
+examples/loadables/stat
+examples/loadables/strptime
+examples/loadables/readline_filter_bun_bridge
+examples/loadables/readline_filter_history_sqlite
+examples/loadables/readline_filter_example
+
+# built shared libraries / compiled plugins
+examples/loadables/*.so
+examples/loadables/readline_filter_go.h
+examples/loadables/Makefile.sample
+examples/loadables/Makefile.in.bak
+
+# build artifacts
+buildconf.h
+configure~
+
+# test artifacts
+tests/sqlite3_query
