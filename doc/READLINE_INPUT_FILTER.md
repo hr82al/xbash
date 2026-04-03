@@ -796,6 +796,96 @@ func readline_filter_keypress(...) C.int {
 
 ---
 
+# SQLite History Plugin
+
+Substring history search with Up/Down arrows, backed by SQLite3 for speed.
+
+## Features
+
+- **Substring search**: matches any part of the command, not just the prefix
+- **Each Up arrow**: finds the next matching entry (not just sequential cycling)
+- **Persistent storage**: `~/.config/bash/history.sql` (SQLite3)
+- **Auto-import**: imports `~/.bash_history` on first run (preserves timestamps)
+- **Deduplication**: repeated commands update their timestamp (most recent first)
+- **Zero changes to bash core**: pure `.so` plugin via `READLINE_INPUT_FILTER_LIB`
+
+## Quick Start
+
+```bash
+# Build
+gcc -shared -fPIC -O2 -o history_sqlite.so \
+    examples/loadables/readline_filter_history_sqlite.c -lsqlite3
+
+# Use
+export READLINE_INPUT_FILTER_LIB=./history_sqlite.so
+bash
+```
+
+Type `git`, press Up — finds all history entries containing "git" anywhere.
+
+## How It Works
+
+```
+1. User types "docker" and presses Up
+2. Plugin queries: SELECT command FROM history
+                    WHERE command LIKE '%docker%'
+                    ORDER BY timestamp DESC
+                    LIMIT 1 OFFSET 0
+3. Result: "docker compose up -d" → replaces the line
+4. User presses Up again → OFFSET 1 → next match
+5. User presses Down → OFFSET decreases or restores original text
+6. User presses Enter → command saved to SQLite with current timestamp
+7. Any other key → stops navigation, resumes normal editing
+```
+
+## Database Schema
+
+```sql
+CREATE TABLE history (
+    id        INTEGER PRIMARY KEY AUTOINCREMENT,
+    command   TEXT NOT NULL UNIQUE,
+    timestamp INTEGER DEFAULT (strftime('%s', 'now'))
+);
+```
+
+- `UNIQUE` on command enables `ON CONFLICT DO UPDATE` for deduplication
+- `timestamp` ordering ensures most recently used commands appear first
+
+## Import from ~/.bash_history
+
+On first run (empty database), the plugin imports `~/.bash_history`:
+
+- Parses `#timestamp` lines (bash's HISTTIMEFORMAT)
+- Preserves original timestamps where available
+- Uses `INSERT OR IGNORE` to skip duplicates
+- Runs in a single transaction for speed (~100K entries in <1 second)
+
+## Requirements
+
+- `libsqlite3` (runtime library)
+- `libsqlite3-dev` (for compilation only)
+
+Debian/Ubuntu: `sudo apt install libsqlite3-dev`
+
+## Inspecting the Database
+
+```bash
+sqlite3 ~/.config/bash/history.sql
+
+-- Recent commands
+SELECT command, datetime(timestamp, 'unixepoch') FROM history
+ORDER BY timestamp DESC LIMIT 20;
+
+-- Search
+SELECT command FROM history WHERE command LIKE '%docker%'
+ORDER BY timestamp DESC;
+
+-- Stats
+SELECT count(*) FROM history;
+```
+
+---
+
 # Bun Integration (React-Style API)
 
 Write readline filters in TypeScript with a React-inspired API: composable

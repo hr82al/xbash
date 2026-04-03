@@ -150,6 +150,145 @@ result=$("$THIS_SH" -c '
 assert_eq "assign nonexistent lib" "survived" "$result"
 
 # ------------------------------------------------------------------ #
+# Test 10-22: SQLite history plugin                                   #
+# ------------------------------------------------------------------ #
+
+SQLITE_SRC="$TEST_DIR/../examples/loadables/readline_filter_history_sqlite.c"
+SQLITE_LIB="$TEST_DIR/history_sqlite_test.so"
+SQ="$TEST_DIR/sqlite3_query"
+TMPHOME="$TEST_DIR/_testhome"
+
+# Build the plugin and the sqlite3 query helper
+gcc -shared -fPIC -O2 -o "$SQLITE_LIB" "$SQLITE_SRC" -lsqlite3 2>/dev/null
+gcc -o "$SQ" "$TEST_DIR/sqlite3_query.c" -lsqlite3 2>/dev/null
+
+if [ -f "$SQLITE_LIB" ] && [ -f "$SQ" ]; then
+
+    rm -rf "$TMPHOME"
+    mkdir -p "$TMPHOME"
+
+    # Test 10: Plugin compiles
+    PASS=$((PASS + 1))
+
+    # Test 11: Interactive bash loads the plugin and creates DB.
+    HOME="$TMPHOME" READLINE_INPUT_FILTER_LIB="$SQLITE_LIB" \
+        "$THIS_SH" -i <<'CMDS' 2>/dev/null
+exit
+CMDS
+    SQLITE_DB="$TMPHOME/.config/bash/history.sql"
+    if [ -f "$SQLITE_DB" ]; then
+        PASS=$((PASS + 1))
+    else
+        FAIL=$((FAIL + 1))
+        echo "FAIL: sqlite db not created at $SQLITE_DB"
+        SQLITE_DB="/dev/null"
+    fi
+
+    # Test 12: Schema has command column
+    result=$("$SQ" "$SQLITE_DB" "SELECT sql FROM sqlite_master WHERE name='history'" 2>/dev/null)
+    case "$result" in
+        *command*TEXT*) PASS=$((PASS + 1)) ;;
+        *) FAIL=$((FAIL + 1)); echo "FAIL: schema missing command TEXT: $result" ;;
+    esac
+
+    # Test 13: Direct SQL insert + query
+    "$SQ" "$SQLITE_DB" "INSERT OR IGNORE INTO history (command, timestamp) VALUES ('git status', 1000)"
+    "$SQ" "$SQLITE_DB" "INSERT OR IGNORE INTO history (command, timestamp) VALUES ('git commit -m test', 1001)"
+    "$SQ" "$SQLITE_DB" "INSERT OR IGNORE INTO history (command, timestamp) VALUES ('docker ps', 1002)"
+    result=$("$SQ" "$SQLITE_DB" "SELECT count(*) FROM history")
+    if [ "$result" -ge 3 ] 2>/dev/null; then
+        PASS=$((PASS + 1))
+    else
+        FAIL=$((FAIL + 1))
+        echo "FAIL: should have >= 3 entries, got '$result'"
+    fi
+
+    # Test 14: Substring search
+    result=$("$SQ" "$SQLITE_DB" \
+        "SELECT command FROM history WHERE command LIKE '%git%' AND command != 'git' ORDER BY timestamp DESC LIMIT 1")
+    case "$result" in
+        *git*) PASS=$((PASS + 1)) ;;
+        *) FAIL=$((FAIL + 1)); echo "FAIL: substring search got '$result'" ;;
+    esac
+
+    # Test 15: Deduplication
+    "$SQ" "$SQLITE_DB" "INSERT INTO history (command) VALUES ('git status') ON CONFLICT(command) DO UPDATE SET timestamp = strftime('%s', 'now')"
+    result=$("$SQ" "$SQLITE_DB" "SELECT count(*) FROM history WHERE command='git status'")
+    assert_eq "dedup: single entry" "1" "$result"
+
+    # Test 16: Most recent first
+    "$SQ" "$SQLITE_DB" "INSERT INTO history (command) VALUES ('docker ps') ON CONFLICT(command) DO UPDATE SET timestamp = strftime('%s', 'now')"
+    result=$("$SQ" "$SQLITE_DB" "SELECT command FROM history ORDER BY timestamp DESC LIMIT 1")
+    assert_eq "most recent first" "docker ps" "$result"
+
+    # Test 17: LIKE search with offset (pagination)
+    r1=$("$SQ" "$SQLITE_DB" "SELECT command FROM history WHERE command LIKE '%git%' AND command != 'git' ORDER BY timestamp DESC LIMIT 1 OFFSET 0")
+    r2=$("$SQ" "$SQLITE_DB" "SELECT command FROM history WHERE command LIKE '%git%' AND command != 'git' ORDER BY timestamp DESC LIMIT 1 OFFSET 1")
+    if [ -n "$r1" ] && [ -n "$r2" ] && [ "$r1" != "$r2" ]; then
+        PASS=$((PASS + 1))
+    else
+        FAIL=$((FAIL + 1))
+        echo "FAIL: offset pagination: '$r1' vs '$r2'"
+    fi
+
+    # Test 18: Plugin creates dir if missing
+    rm -rf "$TMPHOME/.config"
+    HOME="$TMPHOME" READLINE_INPUT_FILTER_LIB="$SQLITE_LIB" \
+        "$THIS_SH" -i <<'CMDS' 2>/dev/null
+exit
+CMDS
+    if [ -f "$TMPHOME/.config/bash/history.sql" ]; then
+        PASS=$((PASS + 1))
+    else
+        FAIL=$((FAIL + 1))
+        echo "FAIL: db dir not recreated"
+    fi
+
+    # Test 19: Import from ~/.bash_history
+    rm -rf "$TMPHOME/.config"
+    printf 'echo hello\nls -la\ngit log --oneline\n' > "$TMPHOME/.bash_history"
+    HOME="$TMPHOME" READLINE_INPUT_FILTER_LIB="$SQLITE_LIB" \
+        "$THIS_SH" -i <<'CMDS' 2>/dev/null
+exit
+CMDS
+    import_count=$("$SQ" "$TMPHOME/.config/bash/history.sql" "SELECT count(*) FROM history")
+    if [ "$import_count" -ge 3 ] 2>/dev/null; then
+        PASS=$((PASS + 1))
+    else
+        FAIL=$((FAIL + 1))
+        echo "FAIL: import expected >= 3, got '$import_count'"
+    fi
+
+    # Test 20: Import with timestamps
+    rm -rf "$TMPHOME/.config"
+    printf '#1700000000\ncommand_with_ts\n#1700000001\nanother_with_ts\n' > "$TMPHOME/.bash_history"
+    HOME="$TMPHOME" READLINE_INPUT_FILTER_LIB="$SQLITE_LIB" \
+        "$THIS_SH" -i <<'CMDS' 2>/dev/null
+exit
+CMDS
+    ts_result=$("$SQ" "$TMPHOME/.config/bash/history.sql" \
+        "SELECT timestamp FROM history WHERE command='command_with_ts'")
+    assert_eq "import preserves timestamps" "1700000000" "$ts_result"
+
+    # Test 21: Empty LIKE matches all
+    all=$("$SQ" "$TMPHOME/.config/bash/history.sql" "SELECT count(*) FROM history WHERE command LIKE '%%'")
+    total=$("$SQ" "$TMPHOME/.config/bash/history.sql" "SELECT count(*) FROM history")
+    assert_eq "empty LIKE matches all" "$total" "$all"
+
+    # Test 22: Non-interactive bash -c does not crash
+    result=$(HOME="$TMPHOME" READLINE_INPUT_FILTER_LIB="$SQLITE_LIB" \
+        "$THIS_SH" -c 'echo noninteractive_ok' 2>/dev/null)
+    assert_eq "non-interactive with sqlite" "noninteractive_ok" "$result"
+
+    # Cleanup
+    rm -f "$SQLITE_LIB" "$SQ"
+    rm -rf "$TMPHOME"
+
+else
+    echo "SKIP: could not compile sqlite plugin or helper"
+fi
+
+# ------------------------------------------------------------------ #
 # Summary                                                             #
 # ------------------------------------------------------------------ #
 
