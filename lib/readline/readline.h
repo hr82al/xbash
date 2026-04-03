@@ -620,6 +620,11 @@ extern rl_hook_func_t *rl_timeout_event_hook;
    there is data available from the current input source. */
 extern rl_hook_func_t *rl_input_available_hook;
 
+/* If non-zero, this is the address of a function to call after each
+   command dispatch, before redisplay.  Allows post-keystroke filtering
+   of the line buffer by an external program. */
+extern rl_hook_func_t *rl_post_command_hook;
+
 /* The address of the function to call to fetch a character from the current
    Readline input stream */
 extern rl_getc_func_t *rl_getc_function;

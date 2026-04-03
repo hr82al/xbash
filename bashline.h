@@ -69,4 +69,8 @@ extern void clear_hostname_list (void);
 extern char **bash_directory_completion_matches (const char *);
 extern char *bash_dequote_text (const char *);
 
+/* READLINE_INPUT_FILTER_LIB shared library filter (hot-reloadable). */
+extern int start_input_filter_lib (const char *);
+extern void stop_input_filter_lib (void);
+
 #endif /* _BASHLINE_H_ */

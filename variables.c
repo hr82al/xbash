@@ -5819,6 +5819,10 @@ static struct name_and_function special_vars[] = {
   { "PATH", sv_path },
   { "POSIXLY_CORRECT", sv_strict_posix },
 
+#if defined (READLINE) && defined (HAVE_DLOPEN) && defined (HAVE_DLSYM)
+  { "READLINE_INPUT_FILTER_LIB", sv_input_filter_lib },
+#endif
+
 #if defined (READLINE)
   { "TERM", sv_terminal },
   { "TERMCAP", sv_terminal },
@@ -5998,6 +6002,22 @@ sv_terminal (const char *name)
   if (interactive_shell && no_line_editing == 0)
     rl_reset_terminal (get_string_value ("TERM"));
 }
+
+#if defined (HAVE_DLOPEN) && defined (HAVE_DLSYM)
+/* What to do when READLINE_INPUT_FILTER_LIB changes.  Hot-reload:
+   dlclose the old library (if any) and dlopen the new one. */
+void
+sv_input_filter_lib (const char *name)
+{
+  char *val;
+
+  stop_input_filter_lib ();
+
+  val = get_string_value (name);
+  if (val && *val)
+    start_input_filter_lib (val);
+}
+#endif /* HAVE_DLOPEN && HAVE_DLSYM */
 
 void
 sv_hostfile (const char *name)

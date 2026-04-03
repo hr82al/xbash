@@ -38,6 +38,14 @@
 #endif
 
 #include <signal.h>
+#include <fcntl.h>
+#include <errno.h>
+
+#include "include/posixwait.h"
+
+#if defined (HAVE_DLFCN_H)
+#  include <dlfcn.h>
+#endif
 
 #include <stdio.h>
 #include "chartypes.h"
@@ -220,6 +228,20 @@ static int posix_edit_macros (int, int);
 
 static int bash_event_hook (void);
 
+/* Input filter (READLINE_INPUT_FILTER) functions */
+static int start_input_filter (const char *);
+static void stop_input_filter (void);
+static int bash_input_filter_hook (void);
+static void apply_filter_response (const char *);
+static void hex_encode (const char *, int, char *);
+static int hex_decode (const char *, char *, int);
+
+/* Input filter library (READLINE_INPUT_FILTER_LIB) functions */
+int start_input_filter_lib (const char *);
+void stop_input_filter_lib (void);
+static int bash_input_filter_lib_hook (void);
+static char **attempt_shell_completion_with_lib (const char *, int, int);
+
 #if defined (PROGRAMMABLE_COMPLETION)
 static int find_cmd_start (int);
 static int find_cmd_end (int);
@@ -277,6 +299,31 @@ static int emacs_edit_and_execute_command (int, int);
 
 /* Non-zero once initialize_readline () has been called. */
 int bash_readline_initialized = 0;
+
+/* State for the READLINE_INPUT_FILTER coprocess. */
+typedef struct {
+  pid_t pid;		/* PID of the filter process */
+  int to_fd;		/* pipe: bash writes to filter's stdin */
+  int from_fd;		/* pipe: bash reads from filter's stdout */
+  int active;		/* nonzero if filter is running and connected */
+} input_filter_state_t;
+
+static input_filter_state_t input_filter = { (pid_t)-1, -1, -1, 0 };
+
+/* State for the READLINE_INPUT_FILTER_LIB shared library filter. */
+typedef struct {
+  void *handle;			/* dlopen() handle */
+  int   active;
+
+  /* Function pointers resolved via dlsym.  NULL = not provided. */
+  int   (*keypress_func)(const char *, int, const char *, int, int, int,
+			 char *, int, int *, int *);
+  char **(*completions_func)(const char *, int, int, const char *, int, int);
+  void  (*display_matches_func)(char **, int, int);
+  void  (*cleanup_func)(void);
+} input_filter_lib_state_t;
+
+static input_filter_lib_state_t input_filter_lib = { NULL, 0, NULL, NULL, NULL, NULL };
 
 /* If non-zero, we do hostname completion, breaking words at `@' and
    trying to complete the stuff after the `@' from our own internal
@@ -643,6 +690,30 @@ initialize_readline (void)
     posix_readline_initialize (1);
 #endif
 
+  /* Set up the input filter coprocess if READLINE_INPUT_FILTER is set. */
+  {
+    char *filter_cmd = get_string_value ("READLINE_INPUT_FILTER");
+    if (filter_cmd && *filter_cmd)
+      {
+	start_input_filter (filter_cmd);
+	rl_post_command_hook = bash_input_filter_hook;
+      }
+  }
+
+  /* Set up the shared library filter if READLINE_INPUT_FILTER_LIB is set.
+     Library takes priority over the coprocess filter. */
+#if defined (HAVE_DLOPEN) && defined (HAVE_DLSYM)
+  {
+    char *lib_path = get_string_value ("READLINE_INPUT_FILTER_LIB");
+    if (lib_path && *lib_path)
+      {
+	if (input_filter.active)
+	  stop_input_filter ();
+	start_input_filter_lib (lib_path);
+      }
+  }
+#endif
+
   bash_readline_initialized = 1;
 }
 
@@ -686,6 +757,20 @@ bashline_reset (void)
   bashline_set_filename_hooks ();
 
   bashline_reset_event_hook ();
+
+  stop_input_filter ();
+
+  /* If lib filter is active, re-install its hooks (bashline_reset restores
+     defaults above, so we need to put our wrappers back). */
+  if (input_filter_lib.active)
+    {
+      if (input_filter_lib.keypress_func)
+	rl_post_command_hook = bash_input_filter_lib_hook;
+      if (input_filter_lib.completions_func)
+	rl_attempted_completion_function = attempt_shell_completion_with_lib;
+      if (input_filter_lib.display_matches_func)
+	rl_completion_display_matches_hook = input_filter_lib.display_matches_func;
+    }
 
   rl_sort_completion_matches = 1;
 }
@@ -5019,5 +5104,585 @@ bash_event_hook (void)
   check_signals_and_traps ();	/* XXX */
   return 0;
 }
+
+/* **************************************************************** */
+/*								    */
+/*	  Common helpers for input filter subsystems		    */
+/*								    */
+/* **************************************************************** */
+
+/* Clamp VAL to the range [0, max]. */
+static inline int
+clamp_line_offset (int val, int max)
+{
+  if (val < 0) return 0;
+  if (val > max) return max;
+  return val;
+}
+
+/* Apply clamped point and mark to rl_point/rl_mark.  Call after
+   maybe_make_readline_line() so rl_end is up to date. */
+static void
+apply_clamped_point_mark (int new_point, int new_mark)
+{
+  rl_point = clamp_line_offset (new_point, rl_end);
+  rl_mark = clamp_line_offset (new_mark, rl_end);
+}
+
+/* **************************************************************** */
+/*								    */
+/*		READLINE_INPUT_FILTER coprocess support		    */
+/*								    */
+/* **************************************************************** */
+
+/* Convert LEN bytes from BUF into hex representation in OUT.
+   OUT must have room for at least LEN*2+1 bytes. */
+static void
+hex_encode (const char *buf, int len, char *out)
+{
+  static const char hextab[] = "0123456789abcdef";
+  int i;
+
+  for (i = 0; i < len; i++)
+    {
+      unsigned char c = (unsigned char)buf[i];
+      out[i * 2] = hextab[c >> 4];
+      out[i * 2 + 1] = hextab[c & 0x0f];
+    }
+  out[len * 2] = '\0';
+}
+
+/* Convert a single hex character to its numeric value, or -1 on error. */
+static inline int
+hex_nibble (int c)
+{
+  if (c >= '0' && c <= '9') return c - '0';
+  if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+  if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+  return -1;
+}
+
+/* Decode hex string HEX into OUT.  OUT must have room for at least
+   strlen(HEX)/2+1 bytes.  Returns the number of decoded bytes, or -1
+   on error. */
+static int
+hex_decode (const char *hex, char *out, int outsize)
+{
+  int i, len, hi, lo;
+
+  len = strlen (hex);
+  if (len % 2 != 0)
+    return -1;
+  if (len / 2 >= outsize)
+    return -1;
+
+  for (i = 0; i < len; i += 2)
+    {
+      hi = hex_nibble (hex[i]);
+      lo = hex_nibble (hex[i + 1]);
+      if (hi < 0 || lo < 0)
+	return -1;
+      out[i / 2] = (char)((hi << 4) | lo);
+    }
+  out[len / 2] = '\0';
+  return len / 2;
+}
+
+/* Launch the input filter coprocess.  CMD is the shell command to run.
+   The filter's stdin/stdout are connected via pipes.  Returns 0 on
+   success, -1 on failure. */
+static int
+start_input_filter (const char *cmd)
+{
+  int bash_to_filter[2], filter_to_bash[2];
+  pid_t pid;
+
+  if (input_filter.active)
+    stop_input_filter ();
+
+  if (pipe (bash_to_filter) < 0)
+    return -1;
+  if (pipe (filter_to_bash) < 0)
+    {
+      close (bash_to_filter[0]);
+      close (bash_to_filter[1]);
+      return -1;
+    }
+
+  pid = fork ();
+  if (pid < 0)
+    {
+      close (bash_to_filter[0]);
+      close (bash_to_filter[1]);
+      close (filter_to_bash[0]);
+      close (filter_to_bash[1]);
+      return -1;
+    }
+
+  if (pid == 0)
+    {
+      /* Child: redirect stdin from pipe, stdout to pipe. */
+      close (bash_to_filter[1]);
+      close (filter_to_bash[0]);
+
+      if (bash_to_filter[0] != STDIN_FILENO)
+	{
+	  dup2 (bash_to_filter[0], STDIN_FILENO);
+	  close (bash_to_filter[0]);
+	}
+      if (filter_to_bash[1] != STDOUT_FILENO)
+	{
+	  dup2 (filter_to_bash[1], STDOUT_FILENO);
+	  close (filter_to_bash[1]);
+	}
+
+      /* Reset signal handlers to default. */
+      signal (SIGPIPE, SIG_DFL);
+      signal (SIGINT, SIG_DFL);
+      signal (SIGTERM, SIG_DFL);
+
+      execl ("/bin/sh", "sh", "-c", cmd, (char *)NULL);
+      _exit (127);
+    }
+
+  /* Parent: close unused pipe ends. */
+  close (bash_to_filter[0]);
+  close (filter_to_bash[1]);
+
+  /* Set the read end to non-blocking so we can use select() with timeout. */
+  fcntl (filter_to_bash[0], F_SETFL,
+	 fcntl (filter_to_bash[0], F_GETFL) | O_NONBLOCK);
+
+  input_filter.pid = pid;
+  input_filter.to_fd = bash_to_filter[1];
+  input_filter.from_fd = filter_to_bash[0];
+  input_filter.active = 1;
+
+  return 0;
+}
+
+/* Shut down the input filter coprocess and reset state. */
+static void
+stop_input_filter (void)
+{
+  if (input_filter.active == 0 && input_filter.pid == (pid_t)-1)
+    return;
+
+  if (input_filter.to_fd >= 0)
+    {
+      close (input_filter.to_fd);
+      input_filter.to_fd = -1;
+    }
+  if (input_filter.from_fd >= 0)
+    {
+      close (input_filter.from_fd);
+      input_filter.from_fd = -1;
+    }
+
+  if (input_filter.pid != (pid_t)-1)
+    {
+      kill (input_filter.pid, SIGTERM);
+      waitpid (input_filter.pid, (int *)NULL, WNOHANG);
+      input_filter.pid = (pid_t)-1;
+    }
+
+  input_filter.active = 0;
+  /* Only clear the hook if we own it (not the lib filter). */
+  if (rl_post_command_hook == bash_input_filter_hook)
+    rl_post_command_hook = (rl_hook_func_t *)NULL;
+}
+
+/* Parse the filter's response and apply changes to the readline buffer.
+   Response format: "{new_point}\t{new_mark}\t{hex_new_line}\n" */
+static void
+apply_filter_response (const char *response)
+{
+  char *tab1, *tab2;
+  long new_point_l, new_mark_l;
+  int new_point, new_mark, decoded_len;
+  char *decoded;
+
+  if (response == NULL || *response == '\0' || *response == '\n')
+    return;
+
+  /* Find the two tab separators. */
+  tab1 = strchr (response, '\t');
+  if (tab1 == NULL)
+    return;
+  tab2 = strchr (tab1 + 1, '\t');
+  if (tab2 == NULL)
+    return;
+
+  /* Parse new_point. */
+  new_point_l = strtol (response, NULL, 10);
+  /* Parse new_mark. */
+  new_mark_l = strtol (tab1 + 1, NULL, 10);
+
+  /* Decode the hex line buffer.  Strip trailing newline if present. */
+  {
+    const char *hex_start = tab2 + 1;
+    int hex_len = strlen (hex_start);
+
+    /* Strip trailing newline/carriage return. */
+    while (hex_len > 0 && (hex_start[hex_len - 1] == '\n' || hex_start[hex_len - 1] == '\r'))
+      hex_len--;
+
+    if (hex_len == 0)
+      {
+	/* Empty hex means empty line. */
+	maybe_make_readline_line ("");
+	rl_point = 0;
+	rl_mark = 0;
+	return;
+      }
+
+    /* We need a null-terminated copy of the hex portion. */
+    {
+      char *hex_copy = xmalloc (hex_len + 1);
+      memcpy (hex_copy, hex_start, hex_len);
+      hex_copy[hex_len] = '\0';
+
+      decoded = xmalloc (hex_len / 2 + 1);
+      decoded_len = hex_decode (hex_copy, decoded, hex_len / 2 + 1);
+      free (hex_copy);
+    }
+  }
+
+  if (decoded_len < 0)
+    {
+      free (decoded);
+      return;
+    }
+
+  /* Apply the new line content. */
+  maybe_make_readline_line (decoded);
+  free (decoded);
+
+  apply_clamped_point_mark ((int)new_point_l, (int)new_mark_l);
+}
+
+/* Get the filter timeout in microseconds from READLINE_INPUT_FILTER_TIMEOUT.
+   Returns -1 for infinite (blocking), or timeout in microseconds.
+   Default is 10000 (10ms) if the variable is not set. */
+static long
+get_filter_timeout_usec (void)
+{
+  char *val;
+  long ms;
+
+  val = get_string_value ("READLINE_INPUT_FILTER_TIMEOUT");
+  if (val == NULL || *val == '\0')
+    return 10000;	/* default 10ms */
+
+  ms = strtol (val, NULL, 10);
+  if (ms == 0)
+    return -1;		/* 0 means infinite/blocking */
+  if (ms < 0)
+    return 10000;	/* negative treated as default */
+
+  return ms * 1000;	/* convert ms to us */
+}
+
+/* Send the current line state to the filter coprocess.
+   Returns 0 on success, -1 if the filter is dead. */
+static int
+filter_send_state (void)
+{
+  char *hex_buf, *hex_keyseq, *msg;
+  int hex_len, keyseq_hex_len, msg_len;
+  ssize_t nw;
+  struct sigaction old_sa, sa;
+
+  keyseq_hex_len = rl_key_sequence_length * 2 + 1;
+  hex_keyseq = xmalloc (keyseq_hex_len);
+  hex_encode (rl_executing_keyseq, rl_key_sequence_length, hex_keyseq);
+
+  hex_len = rl_end * 2 + 1;
+  hex_buf = xmalloc (hex_len);
+  hex_encode (rl_line_buffer, rl_end, hex_buf);
+
+  msg_len = keyseq_hex_len + 64 + hex_len;
+  msg = xmalloc (msg_len);
+  snprintf (msg, msg_len, "%s\t%d\t%d\t%d\t%s\n",
+	    hex_keyseq, rl_point, rl_end, rl_mark, hex_buf);
+  free (hex_keyseq);
+  free (hex_buf);
+
+  /* Temporarily ignore SIGPIPE so a dead filter doesn't kill us. */
+  memset (&sa, 0, sizeof (sa));
+  sa.sa_handler = SIG_IGN;
+  sigemptyset (&sa.sa_mask);
+  sigaction (SIGPIPE, &sa, &old_sa);
+
+  nw = write (input_filter.to_fd, msg, strlen (msg));
+  free (msg);
+
+  sigaction (SIGPIPE, &old_sa, NULL);
+
+  return (nw < 0) ? -1 : 0;
+}
+
+/* Read a single newline-terminated response from the filter coprocess
+   within the configured timeout.  Returns the number of bytes read
+   into RESP_BUF (not including the null terminator), 0 on timeout,
+   or -1 on EOF/fatal error. */
+static int
+filter_recv_response (char *resp_buf, int resp_size)
+{
+  fd_set readfds;
+  struct timeval tv, *tvp;
+  long timeout_usec;
+  int ret, resp_pos = 0;
+  ssize_t nr;
+
+  timeout_usec = get_filter_timeout_usec ();
+
+  FD_ZERO (&readfds);
+  FD_SET (input_filter.from_fd, &readfds);
+
+  if (timeout_usec < 0)
+    tvp = NULL;
+  else
+    {
+      tv.tv_sec = timeout_usec / 1000000;
+      tv.tv_usec = timeout_usec % 1000000;
+      tvp = &tv;
+    }
+
+  ret = select (input_filter.from_fd + 1, &readfds, NULL, NULL, tvp);
+  if (ret <= 0)
+    {
+      resp_buf[0] = '\0';
+      return 0;		/* timeout or signal */
+    }
+
+  while (resp_pos < resp_size - 1)
+    {
+      nr = read (input_filter.from_fd, &resp_buf[resp_pos], 1);
+      if (nr == 1)
+	{
+	  if (resp_buf[resp_pos] == '\n')
+	    { resp_pos++; break; }
+	  resp_pos++;
+	}
+      else if (nr == 0)
+	return -1;	/* EOF */
+      else
+	{
+	  if (errno == EAGAIN || errno == EWOULDBLOCK)
+	    {
+	      if (resp_pos > 0)
+		{
+		  struct timeval extra;
+		  fd_set rfds;
+		  FD_ZERO (&rfds);
+		  FD_SET (input_filter.from_fd, &rfds);
+		  extra.tv_sec = 0;
+		  extra.tv_usec = 5000;
+		  if (select (input_filter.from_fd + 1, &rfds, NULL, NULL, &extra) > 0)
+		    continue;
+		}
+	    }
+	  break;
+	}
+    }
+
+  resp_buf[resp_pos] = '\0';
+  return resp_pos;
+}
+
+/* The post-command hook function.  Called after every key dispatch,
+   before redisplay.  On timeout, falls back to standard behavior. */
+static int
+bash_input_filter_hook (void)
+{
+  char resp_buf[8192];
+  int resp_len;
+
+  if (!input_filter.active || rl_done)
+    return 0;
+
+  if (filter_send_state () < 0)
+    {
+      fprintf (stderr, "\nbash: READLINE_INPUT_FILTER: filter process died\n");
+      stop_input_filter ();
+      return 0;
+    }
+
+  resp_len = filter_recv_response (resp_buf, sizeof (resp_buf));
+  if (resp_len < 0)
+    {
+      fprintf (stderr, "\nbash: READLINE_INPUT_FILTER: filter closed output\n");
+      stop_input_filter ();
+      return 0;
+    }
+
+  if (resp_len > 0 && resp_buf[0] != '\n')
+    apply_filter_response (resp_buf);
+
+  return 0;
+}
+
+/* **************************************************************** */
+/*								    */
+/*	    READLINE_INPUT_FILTER_LIB shared library support	    */
+/*								    */
+/* **************************************************************** */
+
+#if defined (HAVE_DLOPEN) && defined (HAVE_DLSYM)
+
+/* Load the input filter shared library from PATH.  Resolves all optional
+   function pointers via dlsym and installs readline hooks.
+   Returns 0 on success, -1 on failure. */
+int
+start_input_filter_lib (const char *path)
+{
+  typedef int (*init_func_t)(void);
+  init_func_t init_fn;
+  int ret;
+
+  if (input_filter_lib.active)
+    stop_input_filter_lib ();
+
+  input_filter_lib.handle = dlopen (path, RTLD_NOW);
+  if (input_filter_lib.handle == NULL)
+    {
+      builtin_error ("READLINE_INPUT_FILTER_LIB: %s", dlerror ());
+      return -1;
+    }
+
+  /* Resolve optional function pointers.  Missing symbols are not errors. */
+  *(void **)(&input_filter_lib.keypress_func) =
+    dlsym (input_filter_lib.handle, "readline_filter_keypress");
+  *(void **)(&input_filter_lib.completions_func) =
+    dlsym (input_filter_lib.handle, "readline_filter_completions");
+  *(void **)(&input_filter_lib.display_matches_func) =
+    dlsym (input_filter_lib.handle, "readline_filter_display_matches");
+  *(void **)(&input_filter_lib.cleanup_func) =
+    dlsym (input_filter_lib.handle, "readline_filter_cleanup");
+
+  /* Call init if provided. */
+  *(void **)(&init_fn) = dlsym (input_filter_lib.handle, "readline_filter_init");
+  if (init_fn)
+    {
+      ret = init_fn ();
+      if (ret != 0)
+	{
+	  builtin_error ("READLINE_INPUT_FILTER_LIB: init returned %d", ret);
+	  dlclose (input_filter_lib.handle);
+	  memset (&input_filter_lib, 0, sizeof (input_filter_lib));
+	  return -1;
+	}
+    }
+
+  input_filter_lib.active = 1;
+
+  /* Install hooks for provided functions. */
+  if (input_filter_lib.keypress_func)
+    rl_post_command_hook = bash_input_filter_lib_hook;
+
+  if (input_filter_lib.completions_func)
+    rl_attempted_completion_function = attempt_shell_completion_with_lib;
+
+  if (input_filter_lib.display_matches_func)
+    rl_completion_display_matches_hook = input_filter_lib.display_matches_func;
+
+  return 0;
+}
+
+/* Unload the input filter shared library, restoring default hooks. */
+void
+stop_input_filter_lib (void)
+{
+  if (!input_filter_lib.active)
+    return;
+
+  /* Restore hooks to defaults. */
+  if (rl_post_command_hook == bash_input_filter_lib_hook)
+    rl_post_command_hook = (rl_hook_func_t *)NULL;
+
+  if (rl_attempted_completion_function == attempt_shell_completion_with_lib)
+    rl_attempted_completion_function = attempt_shell_completion;
+
+  if (input_filter_lib.display_matches_func &&
+      rl_completion_display_matches_hook == input_filter_lib.display_matches_func)
+    rl_completion_display_matches_hook = (rl_compdisp_func_t *)NULL;
+
+  /* Call cleanup if provided. */
+  if (input_filter_lib.cleanup_func)
+    input_filter_lib.cleanup_func ();
+
+  if (input_filter_lib.handle)
+    dlclose (input_filter_lib.handle);
+
+  memset (&input_filter_lib, 0, sizeof (input_filter_lib));
+}
+
+/* Post-command hook for the shared library filter.  Calls the library's
+   keypress function directly — zero IPC overhead. */
+static int
+bash_input_filter_lib_hook (void)
+{
+  char out_line[8192];
+  int out_point, out_mark, ret;
+
+  if (!input_filter_lib.active || !input_filter_lib.keypress_func || rl_done)
+    return 0;
+
+  out_point = rl_point;
+  out_mark = rl_mark;
+  out_line[0] = '\0';
+
+  ret = input_filter_lib.keypress_func (
+    rl_executing_keyseq, rl_key_sequence_length,
+    rl_line_buffer, rl_end,
+    rl_point, rl_mark,
+    out_line, (int)sizeof (out_line),
+    &out_point, &out_mark);
+
+  if (ret == 1)
+    {
+      out_line[sizeof (out_line) - 1] = '\0';
+      maybe_make_readline_line (out_line);
+      apply_clamped_point_mark (out_point, out_mark);
+    }
+
+  return 0;
+}
+
+/* Completion wrapper: tries the library's completion function first,
+   falls back to bash's default attempt_shell_completion. */
+static char **
+attempt_shell_completion_with_lib (const char *text, int start, int end)
+{
+  if (input_filter_lib.active && input_filter_lib.completions_func)
+    {
+      char **matches;
+      matches = input_filter_lib.completions_func (
+	rl_line_buffer, rl_end, rl_point,
+	text, start, end);
+      if (matches != NULL)
+	return matches;
+    }
+
+  return attempt_shell_completion (text, start, end);
+}
+
+#else /* !HAVE_DLOPEN || !HAVE_DLSYM */
+
+/* Stubs when dynamic loading is not available. */
+int
+start_input_filter_lib (const char *path)
+{
+  builtin_error ("READLINE_INPUT_FILTER_LIB: dynamic loading not supported");
+  return -1;
+}
+
+void
+stop_input_filter_lib (void)
+{
+}
+
+#endif /* HAVE_DLOPEN && HAVE_DLSYM */
 
 #endif /* READLINE */

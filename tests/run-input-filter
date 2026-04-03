@@ -1,0 +1,162 @@
+#!/bin/sh
+# Tests for READLINE_INPUT_FILTER and READLINE_INPUT_FILTER_LIB functionality.
+# This tests the non-interactive parts (hex encode/decode, filter lifecycle,
+# library loading) since interactive readline requires a pty.
+
+THIS_SH="${THIS_SH:-../bash}"
+TEST_DIR="$(cd "$(dirname "$0")" && pwd)"
+PASS=0
+FAIL=0
+
+assert_eq() {
+    local desc="$1" expected="$2" actual="$3"
+    if [ "$expected" = "$actual" ]; then
+        PASS=$((PASS + 1))
+    else
+        FAIL=$((FAIL + 1))
+        echo "FAIL: $desc"
+        echo "  expected: '$expected'"
+        echo "  actual:   '$actual'"
+    fi
+}
+
+assert_ok() {
+    local desc="$1"
+    shift
+    if "$@" >/dev/null 2>&1; then
+        PASS=$((PASS + 1))
+    else
+        FAIL=$((FAIL + 1))
+        echo "FAIL: $desc (exit code $?)"
+    fi
+}
+
+assert_fail() {
+    local desc="$1"
+    shift
+    if "$@" >/dev/null 2>&1; then
+        FAIL=$((FAIL + 1))
+        echo "FAIL: $desc (expected failure, got success)"
+    else
+        PASS=$((PASS + 1))
+    fi
+}
+
+# ------------------------------------------------------------------ #
+# Test 1: Bash builds and runs without filter variables               #
+# ------------------------------------------------------------------ #
+
+assert_ok "bash runs without filters" \
+    "$THIS_SH" -c 'echo hello'
+
+result=$("$THIS_SH" -c 'echo hello')
+assert_eq "basic output" "hello" "$result"
+
+# ------------------------------------------------------------------ #
+# Test 2: READLINE_INPUT_FILTER_LIB with nonexistent file             #
+# ------------------------------------------------------------------ #
+
+# Nonexistent lib produces an error but bash still works.
+result=$(READLINE_INPUT_FILTER_LIB=/nonexistent/lib.so "$THIS_SH" -c 'echo ok' 2>/dev/null)
+assert_eq "nonexistent lib still runs" "ok" "$result"
+
+# ------------------------------------------------------------------ #
+# Test 3: Build and load test .so library                             #
+# ------------------------------------------------------------------ #
+
+TEST_LIB="$TEST_DIR/input-filter-lib-test.so"
+gcc -shared -fPIC -o "$TEST_LIB" "$TEST_DIR/input-filter-lib-test.c" 2>/dev/null
+
+if [ -f "$TEST_LIB" ]; then
+    # Test that the library loads without crashing
+    result=$(READLINE_INPUT_FILTER_LIB="$TEST_LIB" "$THIS_SH" -c 'echo loaded' 2>/dev/null)
+    assert_eq "test lib loads" "loaded" "$result"
+
+    # Test hot-reload: set the variable, then unset
+    result=$(READLINE_INPUT_FILTER_LIB="$TEST_LIB" "$THIS_SH" -c '
+        unset READLINE_INPUT_FILTER_LIB
+        echo unloaded
+    ' 2>/dev/null)
+    assert_eq "test lib unload" "unloaded" "$result"
+
+    rm -f "$TEST_LIB"
+else
+    echo "SKIP: could not compile test .so (gcc not available?)"
+fi
+
+# ------------------------------------------------------------------ #
+# Test 4: READLINE_INPUT_FILTER_TIMEOUT variable parsing              #
+# ------------------------------------------------------------------ #
+
+# Default timeout (no variable set)
+result=$("$THIS_SH" -c 'echo ${READLINE_INPUT_FILTER_TIMEOUT-unset}')
+assert_eq "timeout default unset" "unset" "$result"
+
+# Variable can be set
+result=$(READLINE_INPUT_FILTER_TIMEOUT=50 "$THIS_SH" -c 'echo $READLINE_INPUT_FILTER_TIMEOUT')
+assert_eq "timeout env passthrough" "50" "$result"
+
+# ------------------------------------------------------------------ #
+# Test 5: Pipe filter scripts are valid                               #
+# ------------------------------------------------------------------ #
+
+assert_ok "echo filter is valid bash" \
+    bash -n "$TEST_DIR/input-filter-pipe-echo.sh"
+
+assert_ok "upper filter is valid python" \
+    python3 -c "compile(open('$TEST_DIR/input-filter-pipe-upper.py').read(), 'test', 'exec')"
+
+# ------------------------------------------------------------------ #
+# Test 6: Hex encode/decode round-trip via pipe filter                #
+# ------------------------------------------------------------------ #
+
+# Test the python filter's hex handling directly
+result=$(echo '61\t0\t5\t0\t68656c6c6f' | python3 "$TEST_DIR/input-filter-pipe-upper.py")
+assert_eq "python filter uppercase" "0	0	48454c4c4f" "$result"
+
+# Empty line
+result=$(echo '61\t0\t0\t0\t' | python3 "$TEST_DIR/input-filter-pipe-upper.py")
+assert_eq "python filter empty" "0	0	" "$result"
+
+# ------------------------------------------------------------------ #
+# Test 7: Pipe filter with special characters                        #
+# ------------------------------------------------------------------ #
+
+# Hex for "hello world" = 68656c6c6f20776f726c64
+result=$(echo '61\t5\t11\t0\t68656c6c6f20776f726c64' | python3 "$TEST_DIR/input-filter-pipe-upper.py")
+assert_eq "python filter with space" "5	0	48454c4c4f20574f524c44" "$result"
+
+# ------------------------------------------------------------------ #
+# Test 8: Library filter and pipe filter are mutually exclusive       #
+# ------------------------------------------------------------------ #
+
+# When both are set, bash should not crash
+result=$(
+    READLINE_INPUT_FILTER="cat"
+    READLINE_INPUT_FILTER_LIB=/nonexistent.so
+    "$THIS_SH" -c 'echo both_set' 2>/dev/null
+)
+assert_eq "both filters set" "both_set" "$result"
+
+# ------------------------------------------------------------------ #
+# Test 9: special_vars hook — variable assignment triggers reload     #
+# ------------------------------------------------------------------ #
+
+# Assigning in a non-interactive shell should not crash
+result=$("$THIS_SH" -c '
+    READLINE_INPUT_FILTER_LIB=/nonexistent.so 2>/dev/null
+    echo survived
+' 2>/dev/null)
+assert_eq "assign nonexistent lib" "survived" "$result"
+
+# ------------------------------------------------------------------ #
+# Summary                                                             #
+# ------------------------------------------------------------------ #
+
+echo ""
+echo "input-filter tests: $PASS passed, $FAIL failed"
+
+if [ $FAIL -gt 0 ]; then
+    exit 1
+fi
+exit 0

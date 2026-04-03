@@ -210,6 +210,9 @@ rl_hook_func_t *_rl_internal_startup_hook = (rl_hook_func_t *)NULL;
    reading input characters. */
 rl_hook_func_t *rl_pre_input_hook = (rl_hook_func_t *)NULL;
 
+/* If non-zero, called after each command dispatch, before redisplay. */
+rl_hook_func_t *rl_post_command_hook = (rl_hook_func_t *)NULL;
+
 /* What we use internally.  You should always refer to RL_LINE_BUFFER. */
 static char *the_line;
 
@@ -553,6 +556,11 @@ _rl_internal_char_cleanup (void)
       _rl_want_redisplay = 0;
       rl_newline (1, '\n');
     }
+
+  /* Call the post-command hook before redisplay so that external filters
+     can modify the line buffer and have the changes drawn immediately. */
+  if (rl_post_command_hook && rl_done == 0)
+    (*rl_post_command_hook) ();
 
   if (rl_done == 0)
     {

@@ -459,6 +459,9 @@ extern void sv_comp_wordbreaks (const char *);
 extern void sv_terminal (const char *);
 extern void sv_hostfile (const char *);
 extern void sv_winsize (const char *);
+#if defined (HAVE_DLOPEN) && defined (HAVE_DLSYM)
+extern void sv_input_filter_lib (const char *);
+#endif
 #endif
 
 #if defined (__CYGWIN__)
