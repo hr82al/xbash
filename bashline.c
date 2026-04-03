@@ -5126,41 +5126,47 @@ bash_event_hook (void)
 
 #if defined (SQLITE_HISTORY)
 
-static char sqlite_search_query[8192];
-static char sqlite_saved_line[8192];
-static int  sqlite_search_offset;
-static int  sqlite_navigating;
+/* [Fix #6] Dynamic buffers instead of fixed 8192. */
+static char *sqlite_search_query = NULL;
+static char *sqlite_saved_line = NULL;
+static int   sqlite_search_offset;
+static int   sqlite_navigating;
+
+static void
+sqlite_search_reset (void)
+{
+  sqlite_navigating = 0;
+  sqlite_search_offset = 0;
+}
 
 static int
 sqlite_history_search_backward (int count, int key)
 {
-  const char *result;
+  char *result;
 
   /* Reset navigation if the previous key was not one of our search funcs. */
   if (sqlite_navigating &&
       rl_last_func != sqlite_history_search_backward &&
       rl_last_func != sqlite_history_search_forward)
-    {
-      sqlite_navigating = 0;
-      sqlite_search_offset = 0;
-    }
+    sqlite_search_reset ();
 
   if (!sqlite_navigating)
     {
-      /* First press: save current line as search query. */
       sqlite_navigating = 1;
       sqlite_search_offset = 0;
-      strncpy (sqlite_saved_line, rl_line_buffer, sizeof (sqlite_saved_line) - 1);
-      sqlite_saved_line[sizeof (sqlite_saved_line) - 1] = '\0';
-      strncpy (sqlite_search_query, rl_line_buffer, sizeof (sqlite_search_query) - 1);
-      sqlite_search_query[sizeof (sqlite_search_query) - 1] = '\0';
+      free (sqlite_saved_line);
+      sqlite_saved_line = savestring (rl_line_buffer);
+      free (sqlite_search_query);
+      sqlite_search_query = savestring (rl_line_buffer);
     }
 
+  /* [Fix #1] sqlite_history_search returns malloc'd copy — must free. */
   result = sqlite_history_search (sqlite_search_query, sqlite_search_offset);
   if (result)
     {
       sqlite_search_offset++;
       maybe_make_readline_line (result);
+      free (result);
       rl_point = rl_end;
       return 0;
     }
@@ -5172,35 +5178,36 @@ sqlite_history_search_backward (int count, int key)
 static int
 sqlite_history_search_forward (int count, int key)
 {
-  const char *result;
+  char *result;
 
   if (!sqlite_navigating)
     return 0;
 
-  sqlite_search_offset--;
-
-  if (sqlite_search_offset < 0)
+  /* [Fix #15] Check before decrement. */
+  if (sqlite_search_offset <= 0)
     {
-      /* Past the beginning — restore original line. */
-      sqlite_navigating = 0;
-      sqlite_search_offset = 0;
-      maybe_make_readline_line (sqlite_saved_line);
+      sqlite_search_reset ();
+      if (sqlite_saved_line)
+	maybe_make_readline_line (sqlite_saved_line);
       rl_point = rl_end;
       return 0;
     }
+
+  sqlite_search_offset--;
 
   result = sqlite_history_search (sqlite_search_query, sqlite_search_offset);
   if (result)
     {
       maybe_make_readline_line (result);
+      free (result);
       rl_point = rl_end;
       return 0;
     }
 
-  /* No result at this offset — restore saved line. */
-  sqlite_navigating = 0;
-  sqlite_search_offset = 0;
-  maybe_make_readline_line (sqlite_saved_line);
+  /* No result — restore saved line. */
+  sqlite_search_reset ();
+  if (sqlite_saved_line)
+    maybe_make_readline_line (sqlite_saved_line);
   rl_point = rl_end;
   return 0;
 }

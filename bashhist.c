@@ -387,6 +387,8 @@ sqlite_history_open (void)
     {
       internal_warning ("sqlite history: cannot open %s: %s",
 			path, sqlite3_errmsg (history_db));
+      /* [Fix #8] sqlite3_open always allocates — must close even on error. */
+      sqlite3_close (history_db);
       history_db = NULL;
       free (path);
       return;
@@ -397,17 +399,27 @@ sqlite_history_open (void)
   sqlite3_exec (history_db, "PRAGMA synchronous=NORMAL", NULL, NULL, NULL);
   sqlite3_exec (history_db, schema, NULL, NULL, NULL);
 
-  /* Prepare reusable statements. */
-  sqlite3_prepare_v2 (history_db,
-    "INSERT INTO history (command) VALUES (?1) "
-    "ON CONFLICT(command) DO UPDATE SET timestamp=strftime('%s','now')",
-    -1, &hist_stmt_insert, NULL);
+  /* [Fix #7] Check prepare results and warn on failure. */
+  if (sqlite3_prepare_v2 (history_db,
+      "INSERT INTO history (command) VALUES (?1) "
+      "ON CONFLICT(command) DO UPDATE SET timestamp=strftime('%s','now')",
+      -1, &hist_stmt_insert, NULL) != SQLITE_OK)
+    {
+      internal_warning ("sqlite history: prepare insert: %s",
+			sqlite3_errmsg (history_db));
+    }
 
-  sqlite3_prepare_v2 (history_db,
-    "SELECT command FROM history "
-    "WHERE command LIKE '%' || ?1 || '%' AND command != ?1 "
-    "ORDER BY timestamp DESC LIMIT 1 OFFSET ?2",
-    -1, &hist_stmt_search, NULL);
+  /* [Fix #9] Use INSTR instead of LIKE to avoid wildcard issues with %/_. */
+  /* [Fix #10] Remove `command != ?1` — exact matches are valid results. */
+  if (sqlite3_prepare_v2 (history_db,
+      "SELECT command FROM history "
+      "WHERE (?1 = '' OR INSTR(command, ?1) > 0) "
+      "ORDER BY timestamp DESC LIMIT 1 OFFSET ?2",
+      -1, &hist_stmt_search, NULL) != SQLITE_OK)
+    {
+      internal_warning ("sqlite history: prepare search: %s",
+			sqlite3_errmsg (history_db));
+    }
 }
 
 void
@@ -429,7 +441,6 @@ sqlite_history_add (const char *line)
     return;
   if (line == NULL || *line == '\0')
     return;
-  /* Skip whitespace-only. */
   for (p = line; *p == ' ' || *p == '\t'; p++)
     ;
   if (*p == '\0')
@@ -439,19 +450,27 @@ sqlite_history_add (const char *line)
   sqlite3_step (hist_stmt_insert);
 }
 
-/* Search history for substring match.  Returns result valid until next call.
+/* Search history for substring match.
+   [Fix #1] Returns a malloc'd copy — caller must free().
    Returns NULL if no match at this offset. */
-const char *
+char *
 sqlite_history_search (const char *pattern, int offset)
 {
-  const char *result = NULL;
+  char *result = NULL;
+  const char *text;
+
   if (history_db == NULL || hist_stmt_search == NULL)
     return NULL;
   sqlite3_reset (hist_stmt_search);
   sqlite3_bind_text (hist_stmt_search, 1, pattern ? pattern : "", -1, SQLITE_TRANSIENT);
   sqlite3_bind_int (hist_stmt_search, 2, offset);
   if (sqlite3_step (hist_stmt_search) == SQLITE_ROW)
-    result = (const char *)sqlite3_column_text (hist_stmt_search, 0);
+    {
+      /* [Fix #5] Guard against NULL from sqlite3_column_text on OOM. */
+      text = (const char *)sqlite3_column_text (hist_stmt_search, 0);
+      if (text)
+	result = savestring (text);
+    }
   return result;
 }
 
@@ -460,42 +479,31 @@ static void
 sqlite_history_load (int max)
 {
   sqlite3_stmt *s;
-  const char *sql;
   int i, count;
   char **lines;
 
-  if (history_db == NULL)
+  if (history_db == NULL || max <= 0)
     return;
 
-  /* We need to load in chronological order (oldest first) into readline,
-     but query returns newest first.  So collect into array and reverse. */
-  sql = (max > 0)
-    ? "SELECT command FROM history ORDER BY timestamp DESC LIMIT ?"
-    : "SELECT command FROM history ORDER BY timestamp DESC";
-
-  if (sqlite3_prepare_v2 (history_db, sql, -1, &s, NULL) != SQLITE_OK)
+  /* [Fix #3] Single pass: max is the upper bound, allocate once. */
+  if (sqlite3_prepare_v2 (history_db,
+      "SELECT command FROM history ORDER BY timestamp DESC LIMIT ?",
+      -1, &s, NULL) != SQLITE_OK)
     return;
-  if (max > 0)
-    sqlite3_bind_int (s, 1, max);
+  sqlite3_bind_int (s, 1, max);
 
-  /* First pass: count. */
+  lines = xmalloc (max * sizeof (char *));
   count = 0;
-  while (sqlite3_step (s) == SQLITE_ROW)
-    count++;
-  sqlite3_reset (s);
-  if (max > 0)
-    sqlite3_bind_int (s, 1, max);
-
-  if (count == 0)
-    { sqlite3_finalize (s); return; }
-
-  lines = xmalloc (count * sizeof (char *));
-  i = 0;
-  while (sqlite3_step (s) == SQLITE_ROW && i < count)
-    lines[i++] = savestring ((char *)sqlite3_column_text (s, 0));
+  while (sqlite3_step (s) == SQLITE_ROW && count < max)
+    {
+      /* [Fix #5] Guard against NULL. */
+      const char *text = (const char *)sqlite3_column_text (s, 0);
+      if (text)
+	lines[count++] = savestring (text);
+    }
   sqlite3_finalize (s);
 
-  /* Add in reverse order (oldest first). */
+  /* Add in reverse order (oldest first) into readline memory. */
   for (i = count - 1; i >= 0; i--)
     {
       add_history (lines[i]);
@@ -515,17 +523,18 @@ sqlite_history_import (const char *textfile)
   char line[8192];
   long ts = 0;
   int has_ts = 0, is_empty = 1, count = 0;
-  sqlite3_stmt *s;
+  sqlite3_stmt *s_check, *s_with_ts, *s_without_ts;
 
   if (history_db == NULL || textfile == NULL || *textfile == '\0')
     return;
 
   /* Check if DB already has entries. */
-  if (sqlite3_prepare_v2 (history_db, "SELECT 1 FROM history LIMIT 1", -1, &s, NULL) == SQLITE_OK)
+  if (sqlite3_prepare_v2 (history_db, "SELECT 1 FROM history LIMIT 1",
+      -1, &s_check, NULL) == SQLITE_OK)
     {
-      if (sqlite3_step (s) == SQLITE_ROW)
+      if (sqlite3_step (s_check) == SQLITE_ROW)
 	is_empty = 0;
-      sqlite3_finalize (s);
+      sqlite3_finalize (s_check);
     }
   if (!is_empty)
     return;
@@ -533,6 +542,16 @@ sqlite_history_import (const char *textfile)
   fp = fopen (textfile, "r");
   if (fp == NULL)
     return;
+
+  /* [Fix #4] Prepare statements BEFORE the loop, reuse with reset. */
+  if (sqlite3_prepare_v2 (history_db,
+      "INSERT OR IGNORE INTO history (command, timestamp) VALUES (?,?)",
+      -1, &s_with_ts, NULL) != SQLITE_OK)
+    { fclose (fp); return; }
+  if (sqlite3_prepare_v2 (history_db,
+      "INSERT OR IGNORE INTO history (command) VALUES (?)",
+      -1, &s_without_ts, NULL) != SQLITE_OK)
+    { sqlite3_finalize (s_with_ts); fclose (fp); return; }
 
   sqlite3_exec (history_db, "BEGIN", NULL, NULL, NULL);
 
@@ -555,49 +574,46 @@ sqlite_history_import (const char *textfile)
 
       if (has_ts)
 	{
-	  if (sqlite3_prepare_v2 (history_db,
-	      "INSERT OR IGNORE INTO history (command, timestamp) VALUES (?,?)",
-	      -1, &s, NULL) == SQLITE_OK)
-	    {
-	      sqlite3_bind_text (s, 1, line, -1, SQLITE_TRANSIENT);
-	      sqlite3_bind_int64 (s, 2, ts);
-	      sqlite3_step (s);
-	      sqlite3_finalize (s);
-	    }
+	  sqlite3_reset (s_with_ts);
+	  sqlite3_bind_text (s_with_ts, 1, line, -1, SQLITE_TRANSIENT);
+	  sqlite3_bind_int64 (s_with_ts, 2, ts);
+	  sqlite3_step (s_with_ts);
 	}
       else
 	{
-	  if (sqlite3_prepare_v2 (history_db,
-	      "INSERT OR IGNORE INTO history (command) VALUES (?)",
-	      -1, &s, NULL) == SQLITE_OK)
-	    {
-	      sqlite3_bind_text (s, 1, line, -1, SQLITE_TRANSIENT);
-	      sqlite3_step (s);
-	      sqlite3_finalize (s);
-	    }
+	  sqlite3_reset (s_without_ts);
+	  sqlite3_bind_text (s_without_ts, 1, line, -1, SQLITE_TRANSIENT);
+	  sqlite3_step (s_without_ts);
 	}
       has_ts = 0;
       count++;
     }
 
   sqlite3_exec (history_db, "COMMIT", NULL, NULL, NULL);
+  sqlite3_finalize (s_with_ts);
+  sqlite3_finalize (s_without_ts);
   fclose (fp);
 
   if (count > 0)
     internal_inform ("sqlite history: imported %d entries from %s", count, textfile);
 }
 
-/* Enforce HISTFILESIZE limit on the SQLite database. */
+/* [Fix #2] Enforce HISTFILESIZE limit using prepared statement. */
 void
 sqlite_history_truncate (int max)
 {
-  char sql[256];
+  sqlite3_stmt *s;
   if (history_db == NULL || max <= 0)
     return;
-  snprintf (sql, sizeof (sql),
-    "DELETE FROM history WHERE id NOT IN "
-    "(SELECT id FROM history ORDER BY timestamp DESC LIMIT %d)", max);
-  sqlite3_exec (history_db, sql, NULL, NULL, NULL);
+  if (sqlite3_prepare_v2 (history_db,
+      "DELETE FROM history WHERE id NOT IN "
+      "(SELECT id FROM history ORDER BY timestamp DESC LIMIT ?)",
+      -1, &s, NULL) == SQLITE_OK)
+    {
+      sqlite3_bind_int (s, 1, max);
+      sqlite3_step (s);
+      sqlite3_finalize (s);
+    }
 }
 
 #endif /* SQLITE_HISTORY */
@@ -621,28 +637,30 @@ load_history (void)
   hf = get_string_value ("HISTFILE");
 
 #if defined (SQLITE_HISTORY)
-  /* Open (or create) the SQLite history database. */
+  /* [Fix #12] Try SQLite first; fall back to text file on failure. */
   sqlite_history_open ();
 
-  /* Import text history file on first run (empty DB). */
-  sqlite_history_import (hf);
-
-  /* Load last HISTSIZE entries into readline's in-memory list. */
-  {
-    char *hs = get_string_value ("HISTSIZE");
-    int max = hs ? atoi (hs) : 500;
-    sqlite_history_load (max > 0 ? max : 500);
-  }
-#else
-  /* Read the history in HISTFILE into the history list. */
-  if (hf && *hf && file_exists (hf))
+  if (history_db)
     {
-      while (read_history (hf) == EINTR)	/* 0 on success */
-	QUIT;
-      history_lines_in_file = history_lines_read_from_file;
-      using_history ();
+      sqlite_history_import (hf);
+      {
+	char *hs = get_string_value ("HISTSIZE");
+	int max = hs ? atoi (hs) : 500;
+	sqlite_history_load (max > 0 ? max : 500);
+      }
     }
+  else
 #endif
+    {
+      /* Standard text file history (fallback or non-SQLite build). */
+      if (hf && *hf && file_exists (hf))
+	{
+	  while (read_history (hf) == EINTR)
+	    QUIT;
+	  history_lines_in_file = history_lines_read_from_file;
+	  using_history ();
+	}
+    }
 }
 
 void
@@ -790,19 +808,21 @@ maybe_save_shell_history (void)
   result = 0;
 
 #if defined (SQLITE_HISTORY)
-  /* SQLite history is saved in real-time via bash_add_history().
-     On exit, just enforce HISTFILESIZE limit and close the DB. */
-  {
-    char *hfs = get_string_value ("HISTFILESIZE");
-    if (hfs && *hfs)
-      {
-	int max = atoi (hfs);
-	if (max > 0)
-	  sqlite_history_truncate (max);
-      }
-  }
-  sqlite_history_close ();
-#else
+  if (history_db)
+    {
+      char *hfs = get_string_value ("HISTFILESIZE");
+      if (hfs && *hfs)
+	{
+	  int max = atoi (hfs);
+	  if (max > 0)
+	    sqlite_history_truncate (max);
+	}
+      sqlite_history_close ();
+      return 0;
+    }
+  /* If SQLite failed, fall through to text file save. */
+#endif
+  /* Standard text file save. */
   if (history_lines_this_session > 0)
     {
       hf = get_string_value ("HISTFILE");
@@ -833,7 +853,6 @@ maybe_save_shell_history (void)
 	  sv_histsize ("HISTFILESIZE");
 	}
     }
-#endif
   return (result);
 }
 

@@ -91,7 +91,7 @@ extern char *last_history_line (void);
 extern void sqlite_history_open (void);
 extern void sqlite_history_close (void);
 extern void sqlite_history_add (const char *);
-extern const char *sqlite_history_search (const char *, int);
+extern char *sqlite_history_search (const char *, int);
 extern void sqlite_history_truncate (int);
 #endif
 
