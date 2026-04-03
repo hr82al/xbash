@@ -87,4 +87,12 @@ extern void setup_history_ignore (const char *);
 
 extern char *last_history_line (void);
 
+#if defined (SQLITE_HISTORY)
+extern void sqlite_history_open (void);
+extern void sqlite_history_close (void);
+extern void sqlite_history_add (const char *);
+extern const char *sqlite_history_search (const char *, int);
+extern void sqlite_history_truncate (int);
+#endif
+
 #endif /* _BASHHIST_H_ */

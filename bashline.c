@@ -228,6 +228,11 @@ static int posix_edit_macros (int, int);
 
 static int bash_event_hook (void);
 
+#if defined (SQLITE_HISTORY)
+static int sqlite_history_search_backward (int, int);
+static int sqlite_history_search_forward (int, int);
+#endif
+
 /* Input filter (READLINE_INPUT_FILTER) functions */
 static int start_input_filter (const char *);
 static void stop_input_filter (void);
@@ -688,6 +693,14 @@ initialize_readline (void)
      posixly_correct was set. */
   if (posixly_correct)
     posix_readline_initialize (1);
+#endif
+
+#if defined (SQLITE_HISTORY)
+  /* Rebind Up/Down arrows to use SQLite substring history search. */
+  rl_bind_keyseq ("\033[A", sqlite_history_search_backward);
+  rl_bind_keyseq ("\033[B", sqlite_history_search_forward);
+  rl_bind_keyseq ("\033OA", sqlite_history_search_backward);
+  rl_bind_keyseq ("\033OB", sqlite_history_search_forward);
 #endif
 
   /* Set up the input filter coprocess if READLINE_INPUT_FILTER is set. */
@@ -5104,6 +5117,95 @@ bash_event_hook (void)
   check_signals_and_traps ();	/* XXX */
   return 0;
 }
+
+/* **************************************************************** */
+/*								    */
+/*	SQLite history search for Up/Down arrows		    */
+/*								    */
+/* **************************************************************** */
+
+#if defined (SQLITE_HISTORY)
+
+static char sqlite_search_query[8192];
+static char sqlite_saved_line[8192];
+static int  sqlite_search_offset;
+static int  sqlite_navigating;
+
+static int
+sqlite_history_search_backward (int count, int key)
+{
+  const char *result;
+
+  /* Reset navigation if the previous key was not one of our search funcs. */
+  if (sqlite_navigating &&
+      rl_last_func != sqlite_history_search_backward &&
+      rl_last_func != sqlite_history_search_forward)
+    {
+      sqlite_navigating = 0;
+      sqlite_search_offset = 0;
+    }
+
+  if (!sqlite_navigating)
+    {
+      /* First press: save current line as search query. */
+      sqlite_navigating = 1;
+      sqlite_search_offset = 0;
+      strncpy (sqlite_saved_line, rl_line_buffer, sizeof (sqlite_saved_line) - 1);
+      sqlite_saved_line[sizeof (sqlite_saved_line) - 1] = '\0';
+      strncpy (sqlite_search_query, rl_line_buffer, sizeof (sqlite_search_query) - 1);
+      sqlite_search_query[sizeof (sqlite_search_query) - 1] = '\0';
+    }
+
+  result = sqlite_history_search (sqlite_search_query, sqlite_search_offset);
+  if (result)
+    {
+      sqlite_search_offset++;
+      maybe_make_readline_line (result);
+      rl_point = rl_end;
+      return 0;
+    }
+
+  rl_ding ();
+  return 0;
+}
+
+static int
+sqlite_history_search_forward (int count, int key)
+{
+  const char *result;
+
+  if (!sqlite_navigating)
+    return 0;
+
+  sqlite_search_offset--;
+
+  if (sqlite_search_offset < 0)
+    {
+      /* Past the beginning — restore original line. */
+      sqlite_navigating = 0;
+      sqlite_search_offset = 0;
+      maybe_make_readline_line (sqlite_saved_line);
+      rl_point = rl_end;
+      return 0;
+    }
+
+  result = sqlite_history_search (sqlite_search_query, sqlite_search_offset);
+  if (result)
+    {
+      maybe_make_readline_line (result);
+      rl_point = rl_end;
+      return 0;
+    }
+
+  /* No result at this offset — restore saved line. */
+  sqlite_navigating = 0;
+  sqlite_search_offset = 0;
+  maybe_make_readline_line (sqlite_saved_line);
+  rl_point = rl_end;
+  return 0;
+}
+
+#endif /* SQLITE_HISTORY */
 
 /* **************************************************************** */
 /*								    */

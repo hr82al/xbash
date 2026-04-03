@@ -145,7 +145,7 @@ LOCAL_DEFS = @LOCAL_DEFS@
 LOCALE_DEFS = -DLOCALEDIR='"$(localedir)"' -DPACKAGE='"$(PACKAGE)"'
 
 LOCAL_LIBS = @LOCAL_LIBS@
-LIBS = $(BUILTINS_LIB) $(LIBRARIES) @LIBS@
+LIBS = $(BUILTINS_LIB) $(LIBRARIES) @LIBS@ lib/sqlite3/libsqlite3.a -lm -lpthread
 LIBS_FOR_BUILD = 
 
 STATIC_LD = @STATIC_LD@
@@ -189,7 +189,7 @@ MKDEP_CC = ${CC}
 MKDEP_OPTS = -c ${MKDEP_CC}
 MKDEP_CCFLAGS = ${CCFLAGS}
 
-INCLUDES = -I. @RL_INCLUDE@ -I$(srcdir) -I$(BASHINCDIR) -I$(LIBSRC) $(INTL_INC)
+INCLUDES = -I. @RL_INCLUDE@ -I$(srcdir) -I$(BASHINCDIR) -I$(LIBSRC) -Ilib/sqlite3 $(INTL_INC)
 
 # Maybe add: -Wextra
 GCC_LINT_FLAGS = -O -Wall -Wshadow -Wpointer-arith -Wcast-qual -Wno-parentheses \
